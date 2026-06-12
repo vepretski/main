@@ -19,16 +19,45 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const { data: items } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: 'needs:compliance',
-              state: 'open',
-              per_page: 100,
-            });
+            const label = 'needs:compliance';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            async function labelExists() {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+                return true;
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Label "${label}" does not exist. Nothing to close.`);
+                  return false;
+                }
+                throw error;
+              }
+            }
+
+            if (!(await labelExists())) return;
+
+            let items = [];
+            try {
+              const response = await github.rest.issues.listForRepo({
+                owner,
+                repo,
+                labels: label,
+                state: 'open',
+                per_page: 100,
+              });
+              items = response.data || [];
+            } catch (error) {
+              if (error.status === 404 || error.status === 422) {
+                core.info(`No actionable items for label "${label}".`);
+                return;
+              }
+              throw error;
+            }
 
             if (items.length === 0) {
-              core.info('No open issues/PRs with needs:compliance label');
+              core.info(`No open issues/PRs with ${label} label`);
               return;
             }
 
@@ -36,55 +65,70 @@ jobs:
             const twoHours = 2 * 60 * 60 * 1000;
 
             for (const item of items) {
-              const isPR = !!item.pull_request;
+              const isPR = Boolean(item.pull_request);
               const kind = isPR ? 'PR' : 'issue';
 
               const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner,
+                repo,
                 issue_number: item.number,
+                per_page: 100,
               });
 
-              const complianceComment = comments.find(c => c.body.includes('<!-- issue-compliance -->'));
-              if (!complianceComment) continue;
+              const complianceComment = comments.find((comment) =>
+                (comment.body || '').includes('<!-- issue-compliance -->')
+              );
 
-              const commentAge = now - new Date(complianceComment.created_at).getTime();
+              if (!complianceComment) {
+                core.info(`${kind} #${item.number} has ${label} but no compliance marker comment`);
+                continue;
+              }
+
+              const createdAt = new Date(complianceComment.created_at).getTime();
+              if (!Number.isFinite(createdAt)) {
+                core.info(`${kind} #${item.number} has invalid compliance marker timestamp`);
+                continue;
+              }
+
+              const commentAge = now - createdAt;
               if (commentAge < twoHours) {
                 core.info(`${kind} #${item.number} still within 2-hour window (${Math.round(commentAge / 60000)}m elapsed)`);
                 continue;
               }
 
               const closeMessage = isPR
-                ? 'This pull request has been automatically closed because it was not updated to meet our [contributing guidelines](../blob/dev/CONTRIBUTING.md) within the 2-hour window.\n\nFeel free to open a new pull request that follows our guidelines.'
-                : 'This issue has been automatically closed because it was not updated to meet our [contributing guidelines](../blob/dev/CONTRIBUTING.md) within the 2-hour window.\n\nFeel free to open a new issue that follows our issue templates.';
+                ? 'This pull request has been automatically closed because it was not updated to meet our contributing guidelines within the 2-hour window. Feel free to open a new pull request that follows our guidelines.'
+                : 'This issue has been automatically closed because it was not updated to meet our issue guidelines within the 2-hour window. Feel free to open a new issue that follows our issue templates.';
 
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner,
+                repo,
                 issue_number: item.number,
                 body: closeMessage,
               });
 
               try {
                 await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   issue_number: item.number,
-                  name: 'needs:compliance',
+                  name: label,
                 });
-              } catch (e) {}
+              } catch (error) {
+                core.info(`Could not remove ${label} from ${kind} #${item.number}: ${error.message}`);
+              }
 
               if (isPR) {
                 await github.rest.pulls.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   pull_number: item.number,
                   state: 'closed',
                 });
               } else {
                 await github.rest.issues.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   issue_number: item.number,
                   state: 'closed',
                   state_reason: 'not_planned',
